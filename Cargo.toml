@@ -1,0 +1,11 @@
+[package]
+name = "mio-websocket"
+version = "0.1.0"
+authors = ["Nikita Baksalyar <nikita.baksalyar@gmail.com>"]
+
+[dependencies]
+http-muncher = "0.2.*"
+sha1 = "0.1.*"
+rustc-serialize = "0.3.*"
+byteorder = "0.3.*"
+mio = { git = "https://github.com/carllerche/mio" }
