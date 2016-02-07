@@ -4,10 +4,10 @@ use std::net::SocketAddr;
 use std::thread;
 use std::sync::mpsc;
 
-use mio::{Token, EventLoop, EventSet, PollOpt};
+use mio::{Token, EventLoop, EventSet, PollOpt, Sender};
 use mio::tcp::{TcpListener};
 
-use server::{WebSocketServer, WebSocketServerState, SERVER_TOKEN};
+use server::{WebSocketServer, SERVER_TOKEN};
 
 #[derive(Clone)]
 pub enum WebSocketEvent {
@@ -16,31 +16,30 @@ pub enum WebSocketEvent {
     Ping(Token, Vec<u8>),
     Pong(Token, Vec<u8>),
     TextMessage(Token, String),
-    BinaryMessage(Token, Vec<u8>),
-    // Internal service messages
+    BinaryMessage(Token, Vec<u8>)
+}
+
+pub enum WebSocketInternalMessage {
+    GetPeers(mpsc::Sender<Vec<Token>>),
+    SendMessage(WebSocketEvent),
     Reregister(Token)
 }
 
-pub trait WebSocketHandler {
-    fn run(&mut self, receiver: mpsc::Receiver<WebSocketEvent>, server: &mut WebSocketServerState);
-}
-
 pub struct WebSocket {
-    state: WebSocketServerState
+    events: mpsc::Receiver<WebSocketEvent>,
+    event_loop_tx: Sender<WebSocketInternalMessage>
 }
 
 impl WebSocket {
-    pub fn new(address: SocketAddr) -> (mpsc::Receiver<WebSocketEvent>, WebSocket) {
-        let server_state = WebSocketServerState::new();
-        let mio_server_state = server_state.clone();
-
+    pub fn new(address: SocketAddr) -> WebSocket {
         let (tx, rx) = mpsc::channel();
+
+        let mut event_loop = EventLoop::new().unwrap();
+        let event_loop_tx = event_loop.channel();
 
         thread::spawn(move || {
             let server_socket = TcpListener::bind(&address).unwrap();
-
-            let mut server = WebSocketServer::new(server_socket, mio_server_state, tx);
-            let mut event_loop = EventLoop::new().unwrap();
+            let mut server = WebSocketServer::new(server_socket, tx);
 
             event_loop.register(&server.socket,
                                 SERVER_TOKEN,
@@ -50,14 +49,23 @@ impl WebSocket {
             event_loop.run(&mut server).unwrap();
         });
 
-        (rx, WebSocket { state: server_state })
+        WebSocket {
+            event_loop_tx: event_loop_tx,
+            events: rx
+        }
     }
 
-    pub fn get_peers(&mut self) -> Vec<Token> {
-        self.state.get_peers().unwrap_or_else(Vec::new)
+    pub fn next(&self) -> WebSocketEvent {
+        self.events.recv().unwrap()
+    }
+
+    pub fn get_connected(&mut self) -> Result<Vec<Token>, mpsc::RecvError> {
+        let (tx, rx) = mpsc::channel();
+        self.event_loop_tx.send(WebSocketInternalMessage::GetPeers(tx));
+        rx.recv()
     }
 
     pub fn send(&mut self, msg: WebSocketEvent) {
-        self.state.send_message(msg);
+        self.event_loop_tx.send(WebSocketInternalMessage::SendMessage(msg));
     }
 }

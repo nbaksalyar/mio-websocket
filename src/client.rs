@@ -1,8 +1,10 @@
-use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::fmt;
 use std::error::Error;
 use std::sync::mpsc;
+use std::rc::Rc;
+use std::cell::RefCell;
 
 use mio::*;
 use mio::tcp::*;
@@ -11,8 +13,8 @@ use rustc_serialize::base64::{ToBase64, STANDARD};
 use sha1::Sha1;
 
 use http::HttpParser;
-use frame::{WebSocketFrame, OpCode};
-use interface::WebSocketEvent;
+use frame::{WebSocketFrame, OpCode, BufferedFrameReader};
+use interface::{WebSocketEvent, WebSocketInternalMessage};
 
 const WEBSOCKET_KEY: &'static [u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -29,39 +31,45 @@ fn gen_key(key: &str) -> String {
 }
 
 enum ClientState {
-    AwaitingHandshake(Mutex<Parser<HttpParser>>),
+    AwaitingHandshake(RefCell<Parser<HttpParser>>),
     HandshakeResponse,
     Connected
 }
 
 pub struct WebSocketClient {
     pub socket: TcpStream,
-    headers: Arc<Mutex<HashMap<String, String>>>,
     pub interest: EventSet,
+    headers: Rc<RefCell<HashMap<String, String>>>,
     state: ClientState,
     outgoing: Vec<WebSocketFrame>,
-    tx: Mutex<mpsc::Sender<WebSocketEvent>>,
-    event_loop_tx: Sender<WebSocketEvent>,
-    token: Token
+    outgoing_bytes: Cursor<Vec<u8>>,
+    tx: mpsc::Sender<WebSocketEvent>,
+    event_loop_tx: Sender<WebSocketInternalMessage>,
+    token: Token,
+    frame_reader: BufferedFrameReader,
+    want_close_connection: bool
 }
 
 impl WebSocketClient {
     pub fn new(socket: TcpStream, token: Token, server_sink: mpsc::Sender<WebSocketEvent>,
-               event_loop_sink: Sender<WebSocketEvent>) -> WebSocketClient {
-        let headers = Arc::new(Mutex::new(HashMap::new()));
+               event_loop_sink: Sender<WebSocketInternalMessage>) -> WebSocketClient {
+        let headers = Rc::new(RefCell::new(HashMap::new()));
 
         WebSocketClient {
             socket: socket,
             headers: headers.clone(),
             interest: EventSet::readable(),
-            state: ClientState::AwaitingHandshake(Mutex::new(Parser::request(HttpParser {
+            state: ClientState::AwaitingHandshake(RefCell::new(Parser::request(HttpParser {
                 current_key: None,
                 headers: headers.clone()
             }))),
             outgoing: Vec::new(),
-            tx: Mutex::new(server_sink),
+            outgoing_bytes: Cursor::new(Vec::with_capacity(2048)),
+            tx: server_sink,
             event_loop_tx: event_loop_sink,
             token: token,
+            frame_reader: BufferedFrameReader::new(),
+            want_close_connection: false
         }
     }
 
@@ -84,10 +92,12 @@ impl WebSocketClient {
         self.outgoing.push(frame.unwrap());
 
         if self.interest.is_readable() {
+            trace!("{:?}: sending {} frames, switching to write", self.token, self.outgoing.len());
+
             self.interest.insert(EventSet::writable());
             self.interest.remove(EventSet::readable());
 
-            try!(self.event_loop_tx.send(WebSocketEvent::Reregister(self.token))
+            try!(self.event_loop_tx.send(WebSocketInternalMessage::Reregister(self.token))
                  .map_err(|e| e.description().to_string()));
         }
 
@@ -103,7 +113,7 @@ impl WebSocketClient {
     }
 
     fn write_handshake(&mut self) {
-        let headers = self.headers.lock().unwrap();
+        let headers = self.headers.borrow();
         let response_key = gen_key(&*headers.get("Sec-WebSocket-Key").unwrap());
         let response = fmt::format(format_args!("HTTP/1.1 101 Switching Protocols\r\n\
                                                  Connection: Upgrade\r\n\
@@ -115,37 +125,74 @@ impl WebSocketClient {
         self.state = ClientState::Connected;
 
         // Send the connection event
-        self.tx.lock().unwrap().send(WebSocketEvent::Connect(self.token));
+        self.tx.send(WebSocketEvent::Connect(self.token));
 
         self.interest.remove(EventSet::writable());
         self.interest.insert(EventSet::readable());
     }
 
-    fn write_frames(&mut self) {
-        let mut close_connection = false;
-
+    fn serialize_frames(&mut self) -> Vec<u8> {
+        // FIXME: calculate capacity
+        let mut out_buf = Vec::new();
         {
             for frame in self.outgoing.iter() {
-                println!("outgoing {:?}", frame);
-
-                if let Err(e) = frame.write(&mut self.socket) {
+                if let Err(e) = frame.write(&mut out_buf) {
                     println!("error on write: {}", e);
-                }
-
-                if frame.is_close() {
-                    close_connection = true;
                 }
             }
         }
+        return out_buf;
+    }
 
-        self.outgoing.clear();
+    fn write_frames(&mut self) {
+        if self.outgoing.len() > 0 {
+            let out_buf = self.serialize_frames();
+            self.outgoing_bytes = Cursor::new(out_buf);
 
-        self.interest.remove(EventSet::writable());
-        self.interest.insert(if close_connection {
-            EventSet::hup()
-        } else {
-            EventSet::readable()
-        });
+            // Check if there are close frames
+            for frame in self.outgoing.iter() {
+                if frame.is_close() {
+                    self.want_close_connection = true;
+                }
+            }
+
+            self.outgoing.clear();
+        }
+
+        loop {
+            let mut write_buf: [u8; 2048] = [0; 2048];
+            let read_bytes = self.outgoing_bytes.read(&mut write_buf).unwrap();
+
+            if read_bytes == 0 {
+                // Buffer is exhausted
+                trace!("{:?}: wrote all bytes; switching to reading", self.token);
+                if self.want_close_connection {
+                    trace!("{:?}: closing connection", self.token);
+                    self.socket.shutdown(Shutdown::Write);
+                }
+                self.interest.remove(EventSet::writable());
+                self.interest.insert(EventSet::readable());
+                break;
+            }
+
+            match self.socket.try_write(&write_buf[0..read_bytes]) {
+                Ok(Some(write_bytes)) => {
+                    trace!("{:?}: wrote {}/{} bytes", self.token, write_bytes, read_bytes);
+                    if write_bytes < read_bytes {
+                        self.outgoing_bytes.seek(SeekFrom::Current(-(read_bytes as i64 - write_bytes as i64)));
+                        break;
+                    }
+                },
+                Ok(None) => {
+                    // This write call would block
+                    break;
+                },
+                Err(e) => {
+                    println!("Error occured while writing bytes: {}", e);
+                    break;
+                }
+            }
+        }
     }
 
     pub fn read(&mut self) {
@@ -157,34 +204,51 @@ impl WebSocketClient {
     }
 
     fn read_frame(&mut self) {
-        let frame = WebSocketFrame::read(&mut self.socket);
-
-        match frame {
-            Ok(frame) => {
-                match frame.get_opcode() {
-                    OpCode::TextFrame => {
-                        let payload = String::from_utf8(frame.payload).unwrap();
-                        self.tx.lock().unwrap().send(WebSocketEvent::TextMessage(self.token, payload));
-                    },
-                    OpCode::BinaryFrame => {
-                        self.tx.lock().unwrap().send(WebSocketEvent::BinaryMessage(self.token, frame.payload));
-                    },
-                    OpCode::Ping => {
-                        self.outgoing.push(WebSocketFrame::pong(&frame));
-                    },
-                    OpCode::ConnectionClose => {
-                        self.tx.lock().unwrap().send(WebSocketEvent::Close(self.token));
-                        self.outgoing.push(WebSocketFrame::close_from(&frame));
-                    },
-                    _ => {}
-                }
-
-                if (self.outgoing.len() > 0) {
-                    self.interest.remove(EventSet::readable());
-                    self.interest.insert(EventSet::writable());
+        loop {
+            let mut buf = [0; 2048];
+            match self.socket.try_read(&mut buf) {
+                Err(e) => {
+                    error!("Error while reading socket: {:?}", e);
+                    // TODO: return error here
+                    return
+                },
+                Ok(None) =>
+                    // Socket buffer has got no more bytes.
+                    break,
+                Ok(Some(read_bytes)) => {
+                    let mut cursor = Cursor::<&[u8]>::new(&buf).take(read_bytes as u64);
+                    loop {
+                        if let Some(frame) = self.frame_reader.read(&mut cursor) {
+                            match frame.get_opcode() {
+                                OpCode::TextFrame => {
+                                    let payload = String::from_utf8(frame.payload).unwrap();
+                                    self.tx.send(WebSocketEvent::TextMessage(self.token, payload));
+                                },
+                                OpCode::BinaryFrame => {
+                                    self.tx.send(WebSocketEvent::BinaryMessage(self.token, frame.payload));
+                                },
+                                OpCode::Ping => {
+                                    self.outgoing.push(WebSocketFrame::pong(&frame));
+                                },
+                                OpCode::ConnectionClose => {
+                                    self.tx.send(WebSocketEvent::Close(self.token));
+                                    self.outgoing.push(WebSocketFrame::close_from(&frame));
+                                },
+                                _ => {}
+                            }
+                        } else {
+                            break;
+                        }
+                    }
                 }
             }
-            Err(e) => println!("error while reading frame: {}", e)
+        }
+
+        // Write any buffered outgoing frames
+        if self.outgoing.len() > 0 {
+            trace!("{:?}: sending {} frames, switching to write", self.token, self.outgoing.len());
+            self.interest.remove(EventSet::readable());
+            self.interest.insert(EventSet::writable());
         }
     }
 
@@ -201,7 +265,7 @@ impl WebSocketClient {
                     break,
                 Ok(Some(_)) => {
                     let is_upgrade = if let ClientState::AwaitingHandshake(ref parser_state) = self.state {
-                        let mut parser = parser_state.lock().unwrap();
+                        let mut parser = parser_state.borrow_mut();
                         parser.parse(&buf);
                         parser.is_upgrade()
                     } else { false };
