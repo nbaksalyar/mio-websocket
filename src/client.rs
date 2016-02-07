@@ -13,7 +13,7 @@ use rustc_serialize::base64::{ToBase64, STANDARD};
 use sha1::Sha1;
 
 use http::HttpParser;
-use frame::{WebSocketFrame, OpCode, BufferedFrameReader};
+use websocket_essentials::{Frame, OpCode, BufferedFrameReader};
 use interface::{WebSocketEvent, WebSocketInternalMessage};
 
 const WEBSOCKET_KEY: &'static [u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -41,7 +41,7 @@ pub struct WebSocketClient {
     pub interest: EventSet,
     headers: Rc<RefCell<HashMap<String, String>>>,
     state: ClientState,
-    outgoing: Vec<WebSocketFrame>,
+    outgoing: Vec<Frame>,
     outgoing_bytes: Cursor<Vec<u8>>,
     tx: mpsc::Sender<WebSocketEvent>,
     event_loop_tx: Sender<WebSocketInternalMessage>,
@@ -75,13 +75,14 @@ impl WebSocketClient {
 
     pub fn send_message(&mut self, msg: WebSocketEvent) -> Result<(), String> {
         let frame = match msg {
-            WebSocketEvent::TextMessage(_, ref data) => Some(WebSocketFrame::from(&*data.clone())),
-            WebSocketEvent::BinaryMessage(_, ref data) => Some(WebSocketFrame::from(data.clone())),
+            WebSocketEvent::TextMessage(_, ref data) => Some(Frame::from(&*data.clone())),
+            WebSocketEvent::BinaryMessage(_, ref data) => Some(Frame::from(&*data.clone())),
             WebSocketEvent::Close(_) => {
-                let close_frame = try!(WebSocketFrame::close(0, b"Server-initiated close"));
+                // FIXME: proper error type
+                let close_frame = try!(Frame::close(0, b"Server-initiated close").map_err(|e| e.description().to_owned()));
                 Some(close_frame)
             },
-            WebSocketEvent::Ping(_, ref payload) => Some(WebSocketFrame::ping(payload.clone())),
+            WebSocketEvent::Ping(_, ref payload) => Some(Frame::ping(payload.clone())),
             _ => None
         };
 
@@ -218,26 +219,37 @@ impl WebSocketClient {
                 Ok(Some(read_bytes)) => {
                     let mut cursor = Cursor::<&[u8]>::new(&buf).take(read_bytes as u64);
                     loop {
-                        if let Some(frame) = self.frame_reader.read(&mut cursor) {
-                            match frame.get_opcode() {
-                                OpCode::TextFrame => {
-                                    let payload = String::from_utf8(frame.payload).unwrap();
-                                    self.tx.send(WebSocketEvent::TextMessage(self.token, payload));
-                                },
-                                OpCode::BinaryFrame => {
-                                    self.tx.send(WebSocketEvent::BinaryMessage(self.token, frame.payload));
-                                },
-                                OpCode::Ping => {
-                                    self.outgoing.push(WebSocketFrame::pong(&frame));
-                                },
-                                OpCode::ConnectionClose => {
-                                    self.tx.send(WebSocketEvent::Close(self.token));
-                                    self.outgoing.push(WebSocketFrame::close_from(&frame));
-                                },
-                                _ => {}
+                        match self.frame_reader.read(&mut cursor) {
+                            Err(e) => {
+                                error!("Error while reading frame: {}", e);
+                                // TODO: return error here
+                                break;
+                            },
+                            Ok(None) => break,
+                            Ok(Some(frame)) => {
+                                match frame.get_opcode() {
+                                    OpCode::TextFrame => {
+                                        let payload = ::std::str::from_utf8(&*frame.payload);
+                                        if let Err(e) = payload {
+                                            error!("Utf8 decode error: {}", e);
+                                            // TODO return error here
+                                            break;
+                                        }
+                                        self.tx.send(WebSocketEvent::TextMessage(self.token, payload.unwrap().to_owned()));
+                                    },
+                                    OpCode::BinaryFrame => {
+                                        self.tx.send(WebSocketEvent::BinaryMessage(self.token, (&*frame.payload).to_owned()));
+                                    },
+                                    OpCode::Ping => {
+                                        self.outgoing.push(Frame::pong(&frame));
+                                    },
+                                    OpCode::ConnectionClose => {
+                                        self.tx.send(WebSocketEvent::Close(self.token));
+                                        self.outgoing.push(Frame::close_from(&frame));
+                                    },
+                                    _ => {}
+                                }
                             }
-                        } else {
-                            break;
                         }
                     }
                 }
