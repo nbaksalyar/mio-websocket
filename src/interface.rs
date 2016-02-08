@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::thread;
 use std::sync::mpsc;
 
-use mio::{Token, EventLoop, EventSet, PollOpt, Sender};
+use mio::{Token, EventLoop, EventSet, PollOpt, Sender, NotifyError};
 use mio::tcp::{TcpListener};
 
 use server::{WebSocketServer, SERVER_TOKEN};
@@ -66,6 +66,20 @@ impl WebSocket {
     }
 
     pub fn send(&mut self, msg: WebSocketEvent) {
-        self.event_loop_tx.send(WebSocketInternalMessage::SendMessage(msg));
+        self.send_internal(WebSocketInternalMessage::SendMessage(msg));
+    }
+
+    fn send_internal(&mut self, msg: WebSocketInternalMessage) -> Result<(), NotifyError<WebSocketInternalMessage>> {
+        let mut val = msg;
+        loop {
+            match self.event_loop_tx.send(val) {
+                Err(NotifyError::Full(ret)) => {
+                    // The notify queue is full, retry after some time.
+                    val = ret;
+                    thread::sleep_ms(10);
+                },
+                result @ _ => return result,
+            }
+        }
     }
 }
