@@ -11,6 +11,7 @@ use mio::tcp::*;
 use http_muncher::Parser;
 use rustc_serialize::base64::{ToBase64, STANDARD};
 use sha1::Sha1;
+use bytes::{Buf, ByteBuf, MutByteBuf};
 
 use http::HttpParser;
 use websocket_essentials::{Frame, OpCode, BufferedFrameReader};
@@ -42,12 +43,12 @@ pub struct WebSocketClient {
     headers: Rc<RefCell<HashMap<String, String>>>,
     state: ClientState,
     outgoing: Vec<Frame>,
-    outgoing_bytes: Cursor<Vec<u8>>,
+    outgoing_bytes: ByteBuf,
     tx: mpsc::Sender<WebSocketEvent>,
     event_loop_tx: Sender<WebSocketInternalMessage>,
     token: Token,
     frame_reader: BufferedFrameReader,
-    want_close_connection: bool
+    close_connection: bool
 }
 
 impl WebSocketClient {
@@ -64,12 +65,12 @@ impl WebSocketClient {
                 headers: headers.clone()
             }))),
             outgoing: Vec::new(),
-            outgoing_bytes: Cursor::new(Vec::with_capacity(2048)),
+            outgoing_bytes: ByteBuf::none(),
             tx: server_sink,
             event_loop_tx: event_loop_sink,
             token: token,
             frame_reader: BufferedFrameReader::new(),
-            want_close_connection: false
+            close_connection: false
         }
     }
 
@@ -142,54 +143,43 @@ impl WebSocketClient {
                 }
             }
         }
-        return out_buf;
+        out_buf
     }
 
     fn write_frames(&mut self) {
-        if self.outgoing.len() > 0 {
-            let out_buf = self.serialize_frames();
-            self.outgoing_bytes = Cursor::new(out_buf);
-
-            // Check if there are close frames
-            for frame in self.outgoing.iter() {
-                if frame.is_close() {
-                    self.want_close_connection = true;
-                }
-            }
-
-            self.outgoing.clear();
-        }
-
         loop {
-            let mut write_buf: [u8; 2048] = [0; 2048];
-            let read_bytes = self.outgoing_bytes.read(&mut write_buf).unwrap();
-
-            if read_bytes == 0 {
-                // Buffer is exhausted
-                trace!("{:?}: wrote all bytes; switching to reading", self.token);
-                if self.want_close_connection {
-                    trace!("{:?}: closing connection", self.token);
-                    self.socket.shutdown(Shutdown::Write);
+            if !self.outgoing_bytes.has_remaining() {
+                if self.outgoing.len() > 0 {
+                    trace!("{:?}: has {} more frames to send in queue", self.token, self.outgoing.len());
+                    let out_buf = self.serialize_frames();
+                    self.outgoing_bytes = ByteBuf::from_slice(&*out_buf);
+                    if !self.close_connection {
+                        self.close_connection = self.outgoing.iter().any(|ref frame| frame.is_close());
+                    }
+                    self.outgoing.clear();
+                } else {
+                    // Buffer is exhausted and we have no more frames to send out.
+                    trace!("{:?}: wrote all bytes; switching to reading", self.token);
+                    if self.close_connection {
+                        trace!("{:?}: closing connection", self.token);
+                        self.socket.shutdown(Shutdown::Write);
+                    }
+                    self.interest.remove(EventSet::writable());
+                    self.interest.insert(EventSet::readable());
+                    break;
                 }
-                self.interest.remove(EventSet::writable());
-                self.interest.insert(EventSet::readable());
-                break;
             }
 
-            match self.socket.try_write(&write_buf[0..read_bytes]) {
+            match self.socket.try_write_buf(&mut self.outgoing_bytes) {
                 Ok(Some(write_bytes)) => {
-                    trace!("{:?}: wrote {}/{} bytes", self.token, write_bytes, read_bytes);
-                    if write_bytes < read_bytes {
-                        self.outgoing_bytes.seek(SeekFrom::Current(-(read_bytes as i64 - write_bytes as i64)));
-                        break;
-                    }
+                    trace!("{:?}: wrote {} bytes, remaining: {}", self.token, write_bytes, self.outgoing_bytes.remaining());
                 },
                 Ok(None) => {
                     // This write call would block
                     break;
                 },
                 Err(e) => {
-                    println!("Error occured while writing bytes: {}", e);
+                    error!("Error occured while writing bytes: {}", e);
                     break;
                 }
             }
@@ -206,20 +196,22 @@ impl WebSocketClient {
 
     fn read_frame(&mut self) {
         loop {
-            let mut buf = [0; 2048];
-            match self.socket.try_read(&mut buf) {
+            let mut buf = ByteBuf::mut_with_capacity(16384);
+            match self.socket.try_read_buf(&mut buf) {
                 Err(e) => {
                     error!("Error while reading socket: {:?}", e);
                     // TODO: return error here
                     return
                 },
-                Ok(None) =>
+                Ok(None) | Ok(Some(0)) =>
                     // Socket buffer has got no more bytes.
                     break,
                 Ok(Some(read_bytes)) => {
-                    let mut cursor = Cursor::<&[u8]>::new(&buf).take(read_bytes as u64);
+                    trace!("{:?} read {} bytes", self.token, read_bytes);
+                    let mut read_buf = buf.flip();
+                    let mut frames_cnt = 0;
                     loop {
-                        match self.frame_reader.read(&mut cursor) {
+                        match self.frame_reader.read(&mut read_buf) {
                             Err(e) => {
                                 error!("Error while reading frame: {}", e);
                                 // TODO: return error here
@@ -227,6 +219,7 @@ impl WebSocketClient {
                             },
                             Ok(None) => break,
                             Ok(Some(frame)) => {
+                                frames_cnt += 1;
                                 match frame.get_opcode() {
                                     OpCode::TextFrame => {
                                         let payload = ::std::str::from_utf8(&*frame.payload);
@@ -252,13 +245,15 @@ impl WebSocketClient {
                             }
                         }
                     }
+                    trace!("{:?} parsed {} frames", self.token, frames_cnt);
+                    buf = read_buf.flip();
                 }
             }
         }
 
         // Write any buffered outgoing frames
         if self.outgoing.len() > 0 {
-            trace!("{:?}: sending {} frames, switching to write", self.token, self.outgoing.len());
+            trace!("{:?}: received {} frames, switching to write", self.token, self.outgoing.len());
             self.interest.remove(EventSet::readable());
             self.interest.insert(EventSet::writable());
         }
