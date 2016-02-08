@@ -203,9 +203,15 @@ impl WebSocketClient {
                     // TODO: return error here
                     return
                 },
-                Ok(None) | Ok(Some(0)) =>
+                Ok(None) =>
                     // Socket buffer has got no more bytes.
                     break,
+                Ok(Some(0)) => {
+                    // Remote end has closed connection, we can close it now, too.
+                    self.interest.remove(EventSet::readable());
+                    self.interest.insert(EventSet::hup());
+                    return;
+                },
                 Ok(Some(read_bytes)) => {
                     trace!("{:?} read {} bytes", self.token, read_bytes);
                     let mut read_buf = buf.flip();
