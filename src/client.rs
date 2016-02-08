@@ -12,9 +12,10 @@ use http_muncher::Parser;
 use rustc_serialize::base64::{ToBase64, STANDARD};
 use sha1::Sha1;
 use bytes::{Buf, ByteBuf, MutByteBuf};
+use byteorder::{ByteOrder, BigEndian};
 
 use http::HttpParser;
-use websocket_essentials::{Frame, OpCode, BufferedFrameReader};
+use websocket_essentials::{Frame, OpCode, StatusCode, BufferedFrameReader, ParseError};
 use interface::{WebSocketEvent, WebSocketInternalMessage};
 
 const WEBSOCKET_KEY: &'static [u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -78,11 +79,7 @@ impl WebSocketClient {
         let frame = match msg {
             WebSocketEvent::TextMessage(_, ref data) => Some(Frame::from(&*data.clone())),
             WebSocketEvent::BinaryMessage(_, ref data) => Some(Frame::from(&*data.clone())),
-            WebSocketEvent::Close(_) => {
-                // FIXME: proper error type
-                let close_frame = try!(Frame::close(0, b"Server-initiated close").map_err(|e| e.description().to_owned()));
-                Some(close_frame)
-            },
+            WebSocketEvent::Close(_, status_code) => Some(Frame::close(status_code)),
             WebSocketEvent::Ping(_, ref payload) => Some(Frame::ping(payload.clone())),
             _ => None
         };
@@ -94,7 +91,7 @@ impl WebSocketClient {
         self.outgoing.push(frame.unwrap());
 
         if self.interest.is_readable() {
-            trace!("{:?}: sending {} frames, switching to write", self.token, self.outgoing.len());
+            trace!("{:?} sending {} frames, switching to write", self.token, self.outgoing.len());
 
             self.interest.insert(EventSet::writable());
             self.interest.remove(EventSet::readable());
@@ -104,6 +101,10 @@ impl WebSocketClient {
         }
 
         Ok(())
+    }
+
+    fn close_with_status(&mut self, status: StatusCode) {
+        self.outgoing.push(Frame::close(status));
     }
 
     pub fn write(&mut self) {
@@ -150,7 +151,7 @@ impl WebSocketClient {
         loop {
             if !self.outgoing_bytes.has_remaining() {
                 if self.outgoing.len() > 0 {
-                    trace!("{:?}: has {} more frames to send in queue", self.token, self.outgoing.len());
+                    trace!("{:?} has {} more frames to send in queue", self.token, self.outgoing.len());
                     let out_buf = self.serialize_frames();
                     self.outgoing_bytes = ByteBuf::from_slice(&*out_buf);
                     if !self.close_connection {
@@ -159,9 +160,9 @@ impl WebSocketClient {
                     self.outgoing.clear();
                 } else {
                     // Buffer is exhausted and we have no more frames to send out.
-                    trace!("{:?}: wrote all bytes; switching to reading", self.token);
+                    trace!("{:?} wrote all bytes; switching to reading", self.token);
                     if self.close_connection {
-                        trace!("{:?}: closing connection", self.token);
+                        trace!("{:?} closing connection", self.token);
                         self.socket.shutdown(Shutdown::Write);
                     }
                     self.interest.remove(EventSet::writable());
@@ -172,14 +173,17 @@ impl WebSocketClient {
 
             match self.socket.try_write_buf(&mut self.outgoing_bytes) {
                 Ok(Some(write_bytes)) => {
-                    trace!("{:?}: wrote {} bytes, remaining: {}", self.token, write_bytes, self.outgoing_bytes.remaining());
+                    trace!("{:?} wrote {} bytes, remaining: {}", self.token, write_bytes, self.outgoing_bytes.remaining());
                 },
                 Ok(None) => {
                     // This write call would block
                     break;
                 },
                 Err(e) => {
-                    error!("Error occured while writing bytes: {}", e);
+                    // Write error - close this connnection immediately
+                    error!("{:?} Error occured while writing bytes: {}", self.token, e);
+                    self.interest.remove(EventSet::writable());
+                    self.interest.insert(EventSet::hup());
                     break;
                 }
             }
@@ -199,8 +203,9 @@ impl WebSocketClient {
             let mut buf = ByteBuf::mut_with_capacity(16384);
             match self.socket.try_read_buf(&mut buf) {
                 Err(e) => {
-                    error!("Error while reading socket: {:?}", e);
-                    // TODO: return error here
+                    error!("{:?} Error while reading socket: {:?}", self.token, e);
+                    self.interest.remove(EventSet::readable());
+                    self.interest.insert(EventSet::hup());
                     return
                 },
                 Ok(None) =>
@@ -218,10 +223,16 @@ impl WebSocketClient {
                     let mut frames_cnt = 0;
                     loop {
                         match self.frame_reader.read(&mut read_buf) {
-                            Err(e) => {
-                                error!("Error while reading frame: {}", e);
-                                // TODO: return error here
+                            Err(err @ ParseError::InvalidOpCode(..)) => {
+                                error!("{:?} Invalid OpCode: {}", self.token, err);
+                                self.close_with_status(StatusCode::ProtocolError);
                                 break;
+                            },
+                            Err(e) => {
+                                error!("{:?} Error while reading frame: {}", self.token, e);
+                                self.interest.remove(EventSet::readable());
+                                self.interest.insert(EventSet::hup());
+                                return;
                             },
                             Ok(None) => break,
                             Ok(Some(frame)) => {
@@ -230,8 +241,8 @@ impl WebSocketClient {
                                     OpCode::TextFrame => {
                                         let payload = ::std::str::from_utf8(&*frame.payload);
                                         if let Err(e) = payload {
-                                            error!("Utf8 decode error: {}", e);
-                                            // TODO return error here
+                                            error!("{:?} Utf8 decode error: {}", self.token, e);
+                                            self.close_with_status(StatusCode::ProtocolError);
                                             break;
                                         }
                                         self.tx.send(WebSocketEvent::TextMessage(self.token, payload.unwrap().to_owned()));
@@ -240,11 +251,28 @@ impl WebSocketClient {
                                         self.tx.send(WebSocketEvent::BinaryMessage(self.token, (&*frame.payload).to_owned()));
                                     },
                                     OpCode::Ping => {
-                                        self.outgoing.push(Frame::pong(&frame));
+                                        if frame.payload.len() > 125 {
+                                            error!("{:?} Control frame length is > 125", self.token);
+                                            self.close_with_status(StatusCode::ProtocolError);
+                                        } else {
+                                            self.outgoing.push(Frame::pong(&frame));
+                                        }
                                     },
                                     OpCode::ConnectionClose => {
-                                        self.tx.send(WebSocketEvent::Close(self.token));
-                                        self.outgoing.push(Frame::close_from(&frame));
+                                        let close_ev = if frame.payload.len() >= 2 {
+                                            let status_code = BigEndian::read_u16(&frame.payload[0..2]);
+                                            WebSocketEvent::Close(self.token, StatusCode::from(status_code))
+                                        } else {
+                                            // No status code has been provided
+                                            WebSocketEvent::Close(self.token, StatusCode::Custom(0))
+                                        };
+                                        self.tx.send(close_ev);
+
+                                        if let Ok(response) = Frame::close_from(&frame) {
+                                            self.outgoing.push(response);
+                                        } else {
+                                            self.close_with_status(StatusCode::ProtocolError);
+                                        }
                                     },
                                     _ => {}
                                 }
@@ -259,7 +287,7 @@ impl WebSocketClient {
 
         // Write any buffered outgoing frames
         if self.outgoing.len() > 0 {
-            trace!("{:?}: received {} frames, switching to write", self.token, self.outgoing.len());
+            trace!("{:?} received {} frames, switching to write", self.token, self.outgoing.len());
             self.interest.remove(EventSet::readable());
             self.interest.insert(EventSet::writable());
         }

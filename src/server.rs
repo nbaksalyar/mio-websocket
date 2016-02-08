@@ -48,7 +48,7 @@ impl WebSocketServer {
             WebSocketEvent::TextMessage(tkn, _) |
             WebSocketEvent::BinaryMessage(tkn, _) |
             WebSocketEvent::Connect(tkn) |
-            WebSocketEvent::Close(tkn) |
+            WebSocketEvent::Close(tkn, _) |
             WebSocketEvent::Ping(tkn, _) => {
                 let client = self.clients.get_mut(&tkn).unwrap();
                 if let Err(e) = client.send_message(msg) {

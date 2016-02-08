@@ -6,13 +6,14 @@ use std::sync::mpsc;
 
 use mio::{Token, EventLoop, EventSet, PollOpt, Sender, NotifyError};
 use mio::tcp::{TcpListener};
+use websocket_essentials::{StatusCode};
 
 use server::{WebSocketServer, SERVER_TOKEN};
 
 #[derive(Clone)]
 pub enum WebSocketEvent {
     Connect(Token),
-    Close(Token),
+    Close(Token, StatusCode),
     Ping(Token, Box<[u8]>),
     Pong(Token, Box<[u8]>),
     TextMessage(Token, String),
