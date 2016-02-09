@@ -77,10 +77,10 @@ impl WebSocketClient {
 
     pub fn send_message(&mut self, msg: WebSocketEvent) -> Result<(), String> {
         let frame = match msg {
-            WebSocketEvent::TextMessage(_, ref data) => Some(Frame::from(&*data.clone())),
-            WebSocketEvent::BinaryMessage(_, ref data) => Some(Frame::from(&*data.clone())),
+            WebSocketEvent::TextMessage(_, data) => Some(Frame::from(data)),
+            WebSocketEvent::BinaryMessage(_, data) => Some(Frame::from(data)),
             WebSocketEvent::Close(_, status_code) => Some(Frame::close(status_code)),
-            WebSocketEvent::Ping(_, ref payload) => Some(Frame::ping(payload.clone())),
+            WebSocketEvent::Ping(_, ref payload) => Some(Frame::ping(&*payload)),
             _ => None
         };
 
@@ -239,19 +239,19 @@ impl WebSocketClient {
                                 frames_cnt += 1;
                                 match frame.get_opcode() {
                                     OpCode::TextFrame => {
-                                        let payload = ::std::str::from_utf8(&*frame.payload);
+                                        let payload = String::from_utf8(frame.into_vec());
                                         if let Err(e) = payload {
                                             error!("{:?} Utf8 decode error: {}", self.token, e);
                                             self.close_with_status(StatusCode::ProtocolError);
                                             break;
                                         }
-                                        self.tx.send(WebSocketEvent::TextMessage(self.token, payload.unwrap().to_owned()));
+                                        self.tx.send(WebSocketEvent::TextMessage(self.token, payload.unwrap()));
                                     },
                                     OpCode::BinaryFrame => {
-                                        self.tx.send(WebSocketEvent::BinaryMessage(self.token, (&*frame.payload).to_owned()));
+                                        self.tx.send(WebSocketEvent::BinaryMessage(self.token, frame.into_vec()));
                                     },
                                     OpCode::Ping => {
-                                        if frame.payload.len() > 125 {
+                                        if frame.payload().len() > 125 {
                                             error!("{:?} Control frame length is > 125", self.token);
                                             self.close_with_status(StatusCode::ProtocolError);
                                         } else {
@@ -259,8 +259,8 @@ impl WebSocketClient {
                                         }
                                     },
                                     OpCode::ConnectionClose => {
-                                        let close_ev = if frame.payload.len() >= 2 {
-                                            let status_code = BigEndian::read_u16(&frame.payload[0..2]);
+                                        let close_ev = if frame.payload().len() >= 2 {
+                                            let status_code = BigEndian::read_u16(&frame.payload()[0..2]);
                                             WebSocketEvent::Close(self.token, StatusCode::from(status_code))
                                         } else {
                                             // No status code has been provided
