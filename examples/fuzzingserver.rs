@@ -12,8 +12,8 @@ fn main() {
 
     loop {
         match ws.next() {
-            event @ WebSocketEvent::TextMessage(_, _) |
-            event @ WebSocketEvent::BinaryMessage(_, _) => {
+            event @ (_, WebSocketEvent::TextMessage(_)) |
+            event @ (_, WebSocketEvent::BinaryMessage(_)) => {
                 // Echo back the message that we have received.
                 ws.send(event);
             },

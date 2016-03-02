@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::thread;
 use std::sync::mpsc;
+use std::time::Duration;
 
 use mio::{Token, EventLoop, EventSet, PollOpt, Sender, NotifyError};
 use mio::tcp::{TcpListener};
@@ -12,22 +13,22 @@ use server::{WebSocketServer, SERVER_TOKEN};
 
 #[derive(Clone)]
 pub enum WebSocketEvent {
-    Connect(Token),
-    Close(Token, StatusCode),
-    Ping(Token, Box<[u8]>),
-    Pong(Token, Box<[u8]>),
-    TextMessage(Token, String),
-    BinaryMessage(Token, Vec<u8>)
+    Connect,
+    Close(StatusCode),
+    Ping(Box<[u8]>),
+    Pong(Box<[u8]>),
+    TextMessage(String),
+    BinaryMessage(Vec<u8>)
 }
 
 pub enum WebSocketInternalMessage {
     GetPeers(mpsc::Sender<Vec<Token>>),
-    SendMessage(WebSocketEvent),
+    SendMessage((Token,WebSocketEvent)),
     Reregister(Token)
 }
 
 pub struct WebSocket {
-    events: mpsc::Receiver<WebSocketEvent>,
+    events: mpsc::Receiver<(Token,WebSocketEvent)>,
     event_loop_tx: Sender<WebSocketInternalMessage>
 }
 
@@ -56,17 +57,17 @@ impl WebSocket {
         }
     }
 
-    pub fn next(&self) -> WebSocketEvent {
+    pub fn next(&mut self) -> (Token,WebSocketEvent) {
         self.events.recv().unwrap()
     }
 
     pub fn get_connected(&mut self) -> Result<Vec<Token>, mpsc::RecvError> {
         let (tx, rx) = mpsc::channel();
-        self.event_loop_tx.send(WebSocketInternalMessage::GetPeers(tx));
+        self.send_internal(WebSocketInternalMessage::GetPeers(tx));
         rx.recv()
     }
 
-    pub fn send(&mut self, msg: WebSocketEvent) {
+    pub fn send(&mut self, msg: (Token,WebSocketEvent)) {
         self.send_internal(WebSocketInternalMessage::SendMessage(msg));
     }
 
@@ -77,7 +78,7 @@ impl WebSocket {
                 Err(NotifyError::Full(ret)) => {
                     // The notify queue is full, retry after some time.
                     val = ret;
-                    thread::sleep_ms(10);
+                    thread::sleep(Duration::from_millis(10));
                 },
                 result @ _ => return result,
             }

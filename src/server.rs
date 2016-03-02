@@ -11,13 +11,13 @@ pub const SERVER_TOKEN: Token = Token(0);
 
 pub struct WebSocketServer {
     pub socket: TcpListener,
-    tx: mpsc::Sender<WebSocketEvent>,
+    tx: mpsc::Sender<(Token,WebSocketEvent)>,
     clients: HashMap<Token, WebSocketClient>,
     token_counter: usize
 }
 
 impl WebSocketServer {
-    pub fn new(socket: TcpListener, tx: mpsc::Sender<WebSocketEvent>) -> WebSocketServer {
+    pub fn new(socket: TcpListener, tx: mpsc::Sender<(Token,WebSocketEvent)>) -> WebSocketServer {
         WebSocketServer {
             socket: socket,
             tx: tx,
@@ -26,7 +26,7 @@ impl WebSocketServer {
         }
     }
 
-    fn add_client(&mut self, client_socket: TcpStream, tx: mpsc::Sender<WebSocketEvent>,
+    fn add_client(&mut self, client_socket: TcpStream, tx: mpsc::Sender<(Token,WebSocketEvent)>,
                   event_loop_tx: Sender<WebSocketInternalMessage>) -> Token {
         let new_token = Token(self.token_counter);
         self.token_counter += 1;
@@ -43,21 +43,13 @@ impl WebSocketServer {
         self.clients.remove(tkn)
     }
 
-    pub fn send_message(&mut self, msg: WebSocketEvent) {
-        match msg {
-            WebSocketEvent::TextMessage(tkn, _) |
-            WebSocketEvent::BinaryMessage(tkn, _) |
-            WebSocketEvent::Connect(tkn) |
-            WebSocketEvent::Close(tkn, _) |
-            WebSocketEvent::Ping(tkn, _) => {
-                let client = self.clients.get_mut(&tkn).unwrap();
-                if let Err(e) = client.send_message(msg) {
-                    error!("Error while sending msg to client: {}", e);
-                }
-                // TODO: return Result here
-            },
-            _ => {}
+    pub fn send_message(&mut self, msg: (Token,WebSocketEvent)) {
+        let (tkn, message) = msg;
+        let client = self.clients.get_mut(&tkn).unwrap();
+        if let Err(e) = client.send_message(message) {
+            error!("Error while sending msg to client: {}", e);
         }
+        // TODO: return Result here
     }
 }
 
@@ -121,7 +113,7 @@ impl Handler for WebSocketServer {
             // Close connection
             let client = self.remove_client(&token).unwrap();
             event_loop.deregister(&client.socket);
-            trace!("{:?}: hang up connection", token);
+            trace!("{:?} hang up connection", token);
         }
     }
 }
